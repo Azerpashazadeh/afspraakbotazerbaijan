@@ -1,8 +1,14 @@
 import os
+import sys
 from flask import Flask, request
 import requests
 
 app = Flask(__name__)
+
+
+def log(*args):
+    print(*args, flush=True)
+    sys.stdout.flush()
 
 # --- AYARLAR ---
 TOKEN = os.environ.get("TOKEN", "")   # Meta access token (Railway Variables'tan gelir)
@@ -22,9 +28,9 @@ def mesaj_gonder(kime, metin):
             "type": "text", "text": {"body": metin}}
     try:
         r = requests.post(url, headers=headers, json=data, timeout=10)
-        print("GONDERILDI:", kime, "->", r.status_code, r.text[:200])
+        log("GONDERILDI:", kime, "->", r.status_code, r.text[:200])
     except Exception as e:
-        print("GONDERME HATASI:", e)
+        log("GONDERME HATASI:", e)
 
 
 @app.route("/webhook", methods=["GET"])
@@ -54,7 +60,7 @@ def gelen():
         metin = mesaj["text"]["body"].strip().lower()
         durum = kullanici_durumu.get(gonderen, "yeni")
 
-        print("GELEN:", gonderen, "metin:", metin, "durum:", durum)
+        log("GELEN:", gonderen, "metin:", metin, "durum:", durum)
 
         # 1) "salam" / "randevu" -> HER ZAMAN baştan başlat
         if metin in ["salam", "randevu", "salamlar", "hi", "start", "menu"]:
@@ -95,7 +101,7 @@ def gelen():
         mesaj_gonder(gonderen, cevap)
 
     except (KeyError, IndexError) as e:
-        print("ISLEME HATASI:", e)
+        log("ISLEME HATASI:", e)
 
     return "OK", 200
 
