@@ -5,7 +5,7 @@ import requests
 app = Flask(__name__)
 
 # --- AYARLAR (kendi bilgilerinle doldur) ---
-TOKEN = "EAAVZCyOOtAjwBSPMyPqMvihZB1FOPFqUKPe8ZATJTPM4T1m3oppiXzkTyf1LPdlOxxAgw5ZCZBK77mYSN0tbghzeR1w8JvZCwB2EWAlLAeE4fsumtXZChpDtgHp1b3IQgthsCQtA2PMxzRF8HfDPzkJyL34dHGErbFMqIDVuEL9Djk3LNBL4rPAaSSPNXkveZBLrlgsIK4D58tpaW17anuvNOg4t9jIZBsipbHzDAr4VnCWm2FXwG8Dd6m8ZA1UcZAwerakZBk2dZCKtbZBRlhr5KMLSXmBw9O"   # Meta'dan aldığın access token (24 saatte yenilenir)
+TOKEN = os.environ.get("TOKEN", "")   # Meta'dan aldığın access token (24 saatte yenilenir)
 PHONE_NUMBER_ID = "1148053611735379"     # senin Phone Number ID'in
 VERIFY_TOKEN = "randevu2026"             # webhook için belirlediğin şifre
 # --------------------------------------------
