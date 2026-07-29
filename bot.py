@@ -126,14 +126,15 @@ def _now():
 ACCESS_TOKEN = os.environ["META_ACCESS_TOKEN"]
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID", "")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "azer12345")
-MOLLIE_API_KEY = os.environ["MOLLIE_API_KEY"]
+PAYRIFF_SECRET = os.environ["PAYRIFF_SECRET"]
+PAYRIFF_MERCHANT = os.environ.get("PAYRIFF_MERCHANT", "ES1097758")
 BASE_URL = os.environ.get("BASE_URL", "https://afspraakbotazerbaijan-production.up.railway.app")
 GOOGLE_KEY_JSON = os.environ["GOOGLE_KEY_JSON"]
 
 app = Flask(__name__)
 GRAPH = f"https://graph.facebook.com/v22.0/{PHONE_NUMBER_ID}/messages"
 HEAD = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
-MOLLIE_HEAD = {"Authorization": f"Bearer {MOLLIE_API_KEY}", "Content-Type": "application/json"}
+PAYRIFF_HEAD = {"Authorization": PAYRIFF_SECRET, "Content-Type": "application/json"}
 
 _creds = service_account.Credentials.from_service_account_info(
     json.loads(GOOGLE_KEY_JSON),
@@ -320,16 +321,36 @@ def opschoon_loop():
         _time.sleep(300)  # her 5 dakika
 
 
-# ---------------- Mollie (SIMDILIK TEST - Azerbaycan'da gercek odeme icin yerel saglayici gerekir) ----------------
-def create_mollie_payment(to, start_iso, label, event_id, taal="az"):
-    resp = requests.post("https://api.mollie.com/v2/payments", headers=MOLLIE_HEAD, json={
-        "amount": {"currency": "EUR", "value": AANBETALING_BEDRAG},
-        "description": f"{AANBETALING_OMSCHRIJVING} ({label})",
-        "redirectUrl": f"{BASE_URL}/betaald",
-        "webhookUrl": f"{BASE_URL}/mollie-webhook",
-        "metadata": {"whatsapp": to, "start": start_iso, "label": label, "event_id": event_id, "taal": taal}
-    })
-    return resp.json().get("_links", {}).get("checkout", {}).get("href")
+# ---------------- Payriff (Azerbaycan yerel odeme) ----------------
+# Payriff callback'te metadata dondurmedigi icin, order bilgisini biz saklariz:
+payriff_orders = {}  # orderId -> {whatsapp, label, event_id, taal}
+
+def create_payriff_payment(to, start_iso, label, event_id, taal="az"):
+    dil = {"az": "AZ", "ru": "RU", "en": "EN", "tr": "AZ"}.get(taal, "AZ")
+    try:
+        resp = requests.post("https://api.payriff.com/api/v3/orders",
+                             headers=PAYRIFF_HEAD, json={
+            "amount": float(AANBETALING_BEDRAG),
+            "language": dil,
+            "currency": "AZN",
+            "description": f"{AANBETALING_OMSCHRIJVING} ({label})",
+            "callbackUrl": f"{BASE_URL}/payriff-callback",
+            "cardSave": False,
+            "operation": "PURCHASE"
+        }, timeout=15)
+        data = resp.json()
+        print("PAYRIFF CREATE:", resp.status_code, json.dumps(data)[:500], flush=True)
+        payload = data.get("payload") or {}
+        order_id = payload.get("orderId")
+        payment_url = payload.get("paymentUrl")
+        if order_id:
+            payriff_orders[order_id] = {
+                "whatsapp": to, "label": label, "event_id": event_id, "taal": taal
+            }
+        return payment_url
+    except Exception as e:
+        print("PAYRIFF CREATE HATA:", e, flush=True)
+        return None
 
 
 # ---------------- WhatsApp webhook ----------------
@@ -408,7 +429,7 @@ def webhook():
                     return "ok", 200
                 label = f"{dag_label(start_dt.date(), taal)} {start_dt.strftime('%H:%M')}"
                 event_id = maak_pending(start_dt, frm)
-                link = create_mollie_payment(frm, start_iso, label, event_id, taal)
+                link = create_payriff_payment(frm, start_iso, label, event_id, taal)
                 if link:
                     send_text(frm, tr(taal, "gekozen", label=label, min=RESERVERING_MINUTEN, bedrag=AANBETALING_BEDRAG, link=link))
                 else:
@@ -420,29 +441,42 @@ def webhook():
     return "ok", 200
 
 
-# ---------------- Mollie webhook ----------------
-@app.route("/mollie-webhook", methods=["POST"])
-def mollie_webhook():
+# ---------------- Payriff callback ----------------
+@app.route("/payriff-callback", methods=["POST", "GET"])
+def payriff_callback():
     try:
-        payment_id = request.form.get("id")
-        if not payment_id:
+        # Payriff callback'te orderId gonderir; biz de order durumunu sorgularız
+        data = request.get_json(silent=True) or {}
+        order_id = (data.get("payload") or {}).get("orderId") \
+            or data.get("orderId") \
+            or request.args.get("orderId") \
+            or request.form.get("orderId")
+        print(">>> PAYRIFF CALLBACK:", order_id, json.dumps(data)[:500], flush=True)
+        if not order_id:
             return "ok", 200
-        resp = requests.get(f"https://api.mollie.com/v2/payments/{payment_id}", headers=MOLLIE_HEAD)
-        payment = resp.json()
-        meta = payment.get("metadata", {})
-        to = meta.get("whatsapp")
-        label = meta.get("label", "")
-        event_id = meta.get("event_id")
-        taal = meta.get("taal", "az")
-        status = payment.get("status")
 
-        if status == "paid" and to and event_id:
+        # Order durumunu Payriff'ten dogrula
+        r = requests.get(f"https://api.payriff.com/api/v3/orders/{order_id}",
+                         headers=PAYRIFF_HEAD, timeout=15)
+        payload = (r.json() or {}).get("payload") or {}
+        status = payload.get("paymentStatus")
+        print(">>> PAYRIFF STATUS:", order_id, status, flush=True)
+
+        info = payriff_orders.get(order_id, {})
+        to = info.get("whatsapp")
+        label = info.get("label", "")
+        event_id = info.get("event_id")
+        taal = info.get("taal", "az")
+
+        if status == "PAID" and to and event_id:
             if bevestig_event(event_id):
                 send_text(to, tr(taal, "bevestigd", label=label, bedrijf=BEDRIJF_NAAM))
-        elif status in ("expired", "canceled", "failed") and event_id:
+            payriff_orders.pop(order_id, None)
+        elif status in ("DECLINED", "CANCELED", "EXPIRED", "FAILED") and event_id:
             verwijder_event(event_id)
+            payriff_orders.pop(order_id, None)
     except Exception as e:
-        print("HATA (mollie-webhook):", e)
+        print("HATA (payriff-callback):", e, flush=True)
     return "ok", 200
 
 
