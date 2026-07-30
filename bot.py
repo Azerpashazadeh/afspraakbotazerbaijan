@@ -322,9 +322,12 @@ def opschoon_loop():
 
 
 # ---------------- Payriff (Azerbaycan yerel odeme) ----------------
-# Payriff callback'te metadata dondurmedigi icin, order bilgisini biz saklariz:
-payriff_orders = {}  # orderId -> {whatsapp, label, event_id, taal}
-
+# NOT: Siparisle ilgili bilgi (whatsapp numarasi, event_id, dil, label) artik
+# process belleginde (dict) DEGIL, dogrudan Payriff'in "metadata" alaninda
+# saklaniyor. Payriff bu alani musteriye gostermiyor ve callback/order
+# sorgusunda aynen geri donduruyor. Boylece Railway'de birden fazla worker
+# calissa da, uygulama yeniden baslasa da (redeploy/restart) bilgi kaybolmuyor
+# -- cunku bellege hic yazilmiyor, her seferinde Payriff'ten okunuyor.
 def create_payriff_payment(to, start_iso, label, event_id, taal="az"):
     dil = {"az": "AZ", "ru": "RU", "en": "EN", "tr": "AZ"}.get(taal, "AZ")
     try:
@@ -336,17 +339,18 @@ def create_payriff_payment(to, start_iso, label, event_id, taal="az"):
             "description": f"{AANBETALING_OMSCHRIJVING} ({label})",
             "callbackUrl": f"{BASE_URL}/payriff-callback",
             "cardSave": False,
-            "operation": "PURCHASE"
+            "operation": "PURCHASE",
+            "metadata": {
+                "whatsapp": to,
+                "label": label,
+                "event_id": event_id,
+                "taal": taal,
+            },
         }, timeout=15)
         data = resp.json()
         print("PAYRIFF CREATE:", resp.status_code, json.dumps(data)[:500], flush=True)
         payload = data.get("payload") or {}
-        order_id = payload.get("orderId")
         payment_url = payload.get("paymentUrl")
-        if order_id:
-            payriff_orders[order_id] = {
-                "whatsapp": to, "label": label, "event_id": event_id, "taal": taal
-            }
         return payment_url
     except Exception as e:
         print("PAYRIFF CREATE HATA:", e, flush=True)
@@ -455,26 +459,28 @@ def payriff_callback():
         if not order_id:
             return "ok", 200
 
-        # Order durumunu Payriff'ten dogrula
+        # Order durumunu ve metadata'yi Payriff'ten dogrula.
+        # Bilgi hic bir zaman process belleginde tutulmuyor; her seferinde
+        # dogrudan Payriff'e sorulan bu GET istegiyle geliyor. Bu sayede
+        # birden fazla worker/process olmasi ya da uygulamanin yeniden
+        # baslamasi bu akisi bozmuyor.
         r = requests.get(f"https://api.payriff.com/api/v3/orders/{order_id}",
                          headers=PAYRIFF_HEAD, timeout=15)
         payload = (r.json() or {}).get("payload") or {}
         status = payload.get("paymentStatus")
-        print(">>> PAYRIFF STATUS:", order_id, status, flush=True)
+        meta = payload.get("metadata") or {}
+        print(">>> PAYRIFF STATUS:", order_id, status, "META:", meta, flush=True)
 
-        info = payriff_orders.get(order_id, {})
-        to = info.get("whatsapp")
-        label = info.get("label", "")
-        event_id = info.get("event_id")
-        taal = info.get("taal", "az")
+        to = meta.get("whatsapp")
+        label = meta.get("label", "")
+        event_id = meta.get("event_id")
+        taal = meta.get("taal", "az")
 
         if status == "PAID" and to and event_id:
             if bevestig_event(event_id):
                 send_text(to, tr(taal, "bevestigd", label=label, bedrijf=BEDRIJF_NAAM))
-            payriff_orders.pop(order_id, None)
         elif status in ("DECLINED", "CANCELED", "EXPIRED", "FAILED") and event_id:
             verwijder_event(event_id)
-            payriff_orders.pop(order_id, None)
     except Exception as e:
         print("HATA (payriff-callback):", e, flush=True)
     return "ok", 200
