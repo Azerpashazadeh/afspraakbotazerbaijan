@@ -1,4 +1,4 @@
-from flask import Flask, request, redirect
+from flask import Flask, request, render_template_string
 import requests
 import os
 import json
@@ -11,20 +11,20 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 # ============================================================
-#  MUSTERI AYARLARI (config) - her yeni musteri icin burasi degisir
+#  MUSTERI AYARLARI (config)
 # ============================================================
 BEDRIJF_NAAM = "Salon Test"
-HEADER_AFBEELDING = ""  # ilk mesaj gorseli URL (bos "" = kapali)
+HEADER_AFBEELDING = ""
 BEGROETING = "Salon Test-e xos gelmisiniz!"
 
-# ---- DILLER (Azerbaycan / Rus / Turk / Ingiliz) ----
-STANDAARD_TAAL = "az"   # hicbir dil secilmezse varsayilan
+STANDAARD_TAAL = "az"
 TALEN = [
     {"code": "az", "naam": "\U0001F1E6\U0001F1FF Azərbaycan"},
     {"code": "ru", "naam": "\U0001F1F7\U0001F1FA Русский"},
     {"code": "tr", "naam": "\U0001F1F9\U0001F1F7 Türkçe"},
     {"code": "en", "naam": "\U0001F1EC\U0001F1E7 English"},
 ]
+
 T = {
     "az": {
         "kies_taal": "Dil seçin:",
@@ -109,20 +109,19 @@ AANBETALING_BEDRAG = "5.00"
 AANBETALING_OMSCHRIJVING = "Beh - Salon Test"
 
 CALENDAR_ID = os.environ.get("CALENDAR_ID", "")
-WERKDAG_START = 9        # calisma baslangici (saat)
-WERKDAG_EIND = 18        # calisma bitisi (saat)
-AFSPRAAK_DUUR = 30       # randevu suresi (dakika)
-DAGEN_VOORUIT = 60       # toplam kac gun ileriye bakilabilir
-BLOK_GROOTTE = 9         # her aralik kac gun (9 gun)
-RESERVERING_MINUTEN = 15 # odenmezse kac dk sonra silinsin
-TIJDZONE = "Asia/Baku"   # Azerbaycan saati
+WERKDAG_START = 9
+WERKDAG_EIND = 18
+AFSPRAAK_DUUR = 30
+DAGEN_VOORUIT = 60
+BLOK_GROOTTE = 9
+RESERVERING_MINUTEN = 15
+TIJDZONE = "Asia/Baku"
 TZ = ZoneInfo(TIJDZONE)
 
 def _now():
     return datetime.now(TZ)
-# ============================================================
 
-# ---- SISTEM (Railway Variables) ----
+# ---- SISTEM ----
 ACCESS_TOKEN = os.environ["META_ACCESS_TOKEN"]
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID", "")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "azer12345")
@@ -145,72 +144,75 @@ cal_service = build("calendar", "v3", credentials=_creds, cache_discovery=False)
 PENDING_TAG = "[GOZLEMEDE]"
 CONFIRMED_TAG = "[TESDIQLENDI]"
 
-
 # ---------------- WhatsApp ----------------
 def send_text(to, body):
-    r = requests.post(GRAPH, headers=HEAD, json={
-        "messaging_product": "whatsapp", "to": to,
-        "type": "text", "text": {"body": body}
-    })
-    if r.status_code >= 400:
-        print("SEND_TEXT FAIL:", r.status_code, r.text[:500], flush=True)
-
-
-def send_image(to, link):
-    """Ayri bir resim mesaji gonderir."""
-    r = requests.post(GRAPH, headers=HEAD, json={
-        "messaging_product": "whatsapp", "to": to,
-        "type": "image", "image": {"link": link}
-    })
-    if r.status_code >= 400:
-        print("SEND_IMAGE FAIL:", r.status_code, r.text[:500], flush=True)
-
+    try:
+        r = requests.post(GRAPH, headers=HEAD, json={
+            "messaging_product": "whatsapp", "to": to,
+            "type": "text", "text": {"body": body}
+        }, timeout=10)
+        if r.status_code >= 400:
+            print(f"SEND_TEXT FAIL: {r.status_code} - {r.text[:200]}")
+            return False
+        print(f"✅ WhatsApp mesajı gönderildi: {to}")
+        return True
+    except Exception as e:
+        print(f"SEND_TEXT HATA: {e}")
+        return False
 
 def send_list(to, header, body, button_text, rows, afbeelding=None):
-    # Resim varsa once ayri mesaj olarak gonder, kisa bir gecikmeyle siralamayi koru
     if afbeelding:
-        send_image(to, afbeelding)
-        _time.sleep(0.2)
-    header_text = (header or BEDRIJF_NAAM or "Menu")[:60]
+        try:
+            requests.post(GRAPH, headers=HEAD, json={
+                "messaging_product": "whatsapp", "to": to,
+                "type": "image", "image": {"link": afbeelding}
+            }, timeout=10)
+            _time.sleep(0.2)
+        except:
+            pass
+    
     interactive = {
         "type": "list",
-        "header": {"type": "text", "text": header_text},
+        "header": {"type": "text", "text": (header or BEDRIJF_NAAM)[:60]},
         "body": {"text": (body or " ")[:1024]},
-        "action": {"button": (button_text or "Seç")[:20],
-                   "sections": [{"title": "Seçimlər", "rows": rows[:10]}]}
+        "action": {
+            "button": (button_text or "Seç")[:20],
+            "sections": [{"title": "Seçimlər", "rows": rows[:10]}]
+        }
     }
-    r = requests.post(GRAPH, headers=HEAD, json={
-        "messaging_product": "whatsapp", "to": to,
-        "type": "interactive",
-        "interactive": interactive
-    })
-    if r.status_code >= 400:
-        print("SEND_LIST FAIL:", r.status_code, r.text[:500], flush=True)
+    try:
+        r = requests.post(GRAPH, headers=HEAD, json={
+            "messaging_product": "whatsapp", "to": to,
+            "type": "interactive", "interactive": interactive
+        }, timeout=10)
+        if r.status_code >= 400:
+            print(f"SEND_LIST FAIL: {r.status_code} - {r.text[:200]}")
+    except Exception as e:
+        print(f"SEND_LIST HATA: {e}")
 
-
-# ---------------- Takvim okuma (dogrudan events.list) ----------------
+# ---------------- Takvim ----------------
 def _events_between(start_dt, eind_dt):
-    """Verilen aralikta takvimdeki tum etkinlikleri (start,end) TZ-aware olarak dondurur."""
-    res = cal_service.events().list(
-        calendarId=CALENDAR_ID,
-        timeMin=start_dt.isoformat(),
-        timeMax=eind_dt.isoformat(),
-        singleEvents=True, orderBy="startTime"
-    ).execute()
-    out = []
-    for ev in res.get("items", []):
-        s = ev["start"].get("dateTime")
-        e = ev["end"].get("dateTime")
-        if not s or not e:
-            continue
-        s = datetime.fromisoformat(s).astimezone(TZ)
-        e = datetime.fromisoformat(e).astimezone(TZ)
-        out.append((s, e))
-    return out
-
+    try:
+        res = cal_service.events().list(
+            calendarId=CALENDAR_ID,
+            timeMin=start_dt.isoformat(),
+            timeMax=eind_dt.isoformat(),
+            singleEvents=True, orderBy="startTime"
+        ).execute()
+        out = []
+        for ev in res.get("items", []):
+            s = ev["start"].get("dateTime")
+            e = ev["end"].get("dateTime")
+            if s and e:
+                s = datetime.fromisoformat(s).astimezone(TZ)
+                e = datetime.fromisoformat(e).astimezone(TZ)
+                out.append((s, e))
+        return out
+    except Exception as e:
+        print(f"_events_between HATA: {e}")
+        return []
 
 def bos_slotlar(d):
-    """Bir gunun bos saat slotlarini (TZ-aware datetime listesi) dondurur."""
     dag_start = datetime.combine(d, dtime(WERKDAG_START, 0), tzinfo=TZ)
     dag_eind = datetime.combine(d, dtime(WERKDAG_EIND, 0), tzinfo=TZ)
     bezet = _events_between(dag_start, dag_eind)
@@ -226,17 +228,15 @@ def bos_slotlar(d):
         t = slot_eind
     return slots
 
-
 def bos_gunler_in_blok(blok_index, limit=9):
-    """blok_index. araliktaki (9 gunluk) bos gunleri dondurur."""
     result = []
     vandaag = _now().date()
-    start_offset = 1 + blok_index * BLOK_GROOTTE   # yarindan itibaren
+    start_offset = 1 + blok_index * BLOK_GROOTTE
     for i in range(start_offset, start_offset + BLOK_GROOTTE):
         if i > DAGEN_VOORUIT:
             break
         d = vandaag + timedelta(days=i)
-        if d.weekday() >= 5:   # hafta sonu atla (gerekirse degistir)
+        if d.weekday() >= 5:
             continue
         if bos_slotlar(d):
             result.append(d)
@@ -244,21 +244,16 @@ def bos_gunler_in_blok(blok_index, limit=9):
             break
     return result
 
-
 def dag_label(d, taal=STANDAARD_TAAL):
     dl = T.get(taal, T[STANDAARD_TAAL])
     return f"{dl['dag_labels'][d.weekday()]} {d.day} {dl['maanden'][d.month]}"
-
 
 def blok_label(blok_index, taal=STANDAARD_TAAL):
     start = 1 + blok_index * BLOK_GROOTTE
     eind = start + BLOK_GROOTTE - 1
     return tr(taal, "periode_label", a=start, b=eind)
 
-
-# ---------------- Takvime yazma / silme ----------------
 def maak_pending(start_dt, klant_nummer):
-    """Slot secilince: takvime GOZLEMEDE kaydi at. Event id dondurur."""
     if start_dt.tzinfo is None:
         start_dt = start_dt.replace(tzinfo=TZ)
     eind_dt = start_dt + timedelta(minutes=AFSPRAAK_DUUR)
@@ -271,9 +266,7 @@ def maak_pending(start_dt, klant_nummer):
     created = cal_service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
     return created["id"]
 
-
 def bevestig_event(event_id):
-    """Odeme gelince: GOZLEMEDE -> TESDIQLENDI."""
     try:
         ev = cal_service.events().get(calendarId=CALENDAR_ID, eventId=event_id).execute()
         ev["summary"] = ev["summary"].replace(PENDING_TAG, CONFIRMED_TAG)
@@ -281,18 +274,16 @@ def bevestig_event(event_id):
         cal_service.events().update(calendarId=CALENDAR_ID, eventId=event_id, body=ev).execute()
         return True
     except Exception as e:
-        print("bevestig_event HATA:", e)
+        print(f"bevestig_event HATA: {e}")
         return False
-
 
 def verwijder_event(event_id):
     try:
         cal_service.events().delete(calendarId=CALENDAR_ID, eventId=event_id).execute()
     except Exception as e:
-        print("verwijder_event HATA:", e)
+        print(f"verwijder_event HATA: {e}")
 
-
-# ---------------- Temizleyici: odenmemis GOZLEMEDE kayitlari sil ----------------
+# ---------------- Temizleyici ----------------
 def opschoon_loop():
     while True:
         try:
@@ -315,36 +306,36 @@ def opschoon_loop():
                 leeftijd = (datetime.now(created_dt.tzinfo) - created_dt).total_seconds() / 60
                 if leeftijd > RESERVERING_MINUTEN:
                     verwijder_event(ev["id"])
-                    print("Temizlendi (odenmemis):", ev.get("summary"))
+                    print(f"Temizlendi: {ev.get('summary')}")
         except Exception as e:
-            print("opschoon_loop HATA:", e)
-        _time.sleep(300)  # her 5 dakika
+            print(f"opschoon_loop HATA: {e}")
+        _time.sleep(300)
 
-
-# ---------------- Payriff (Azerbaycan yerel odeme) ----------------
-# Payriff callback'te metadata dondurmedigi icin, order bilgisini biz saklariz:
-payriff_orders = {}  # orderId -> {whatsapp, label, event_id, taal}
+# ---------------- Payriff ----------------
+payriff_orders = {}
 
 def create_payriff_payment(to, start_iso, label, event_id, taal="az"):
     dil = {"az": "AZ", "ru": "RU", "en": "EN", "tr": "AZ"}.get(taal, "AZ")
     try:
-        # Önce order oluştur
-        resp = requests.post("https://api.payriff.com/api/v3/orders",
-                             headers=PAYRIFF_HEAD, json={
-            "amount": float(AANBETALING_BEDRAG),
-            "language": dil,
-            "currency": "AZN",
-            "description": f"{AANBETALING_OMSCHRIJVING} ({label})",
-            "callbackUrl": f"{BASE_URL}/payriff-callback",
-            "cardSave": False,
-            "operation": "PURCHASE"
-        }, timeout=30)
+        resp = requests.post(
+            "https://api.payriff.com/api/v3/orders",
+            headers=PAYRIFF_HEAD,
+            json={
+                "amount": float(AANBETALING_BEDRAG),
+                "language": dil,
+                "currency": "AZN",
+                "description": f"{AANBETALING_OMSCHRIJVING} ({label})",
+                "callbackUrl": f"{BASE_URL}/payriff-callback",
+                "cardSave": False,
+                "operation": "PURCHASE"
+            },
+            timeout=30
+        )
         
-        print("PAYRIFF CREATE STATUS:", resp.status_code, flush=True)
-        print("PAYRIFF CREATE RESPONSE:", resp.text, flush=True)
+        print(f"PAYRIFF CREATE STATUS: {resp.status_code}")
+        print(f"PAYRIFF CREATE RESPONSE: {resp.text[:500]}")
         
         if resp.status_code != 200:
-            print("PAYRIFF CREATE FAILED:", resp.status_code, flush=True)
             return None
             
         data = resp.json()
@@ -352,67 +343,52 @@ def create_payriff_payment(to, start_iso, label, event_id, taal="az"):
         order_id = payload.get("orderId")
         payment_url = payload.get("paymentUrl")
         
-        print(f"PAYRIFF ORDER ID: {order_id}, PAYMENT URL: {payment_url}", flush=True)
-        
         if order_id and payment_url:
             payriff_orders[order_id] = {
-                "whatsapp": to, 
-                "label": label, 
-                "event_id": event_id, 
-                "taal": taal,
-                "payment_url": payment_url
+                "whatsapp": to,
+                "label": label,
+                "event_id": event_id,
+                "taal": taal
             }
-            print(f"PAYRIFF ORDER STORED: {order_id}", flush=True)
+            print(f"✅ Payriff order oluşturuldu: {order_id}")
             return payment_url
-        else:
-            print(f"PAYRIFF MISSING ORDER ID OR URL: {data}", flush=True)
-            return None
-            
+        return None
     except Exception as e:
-        print("PAYRIFF CREATE HATA:", str(e), flush=True)
-        import traceback
-        traceback.print_exc()
+        print(f"create_payriff_payment HATA: {e}")
         return None
 
-
-# ---------------- WhatsApp webhook ----------------
+# ---------------- Webhook ----------------
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
-    # --- GET: dogrulama ---
     if request.method == "GET":
         if request.args.get("hub.verify_token") == VERIFY_TOKEN:
             return request.args.get("hub.challenge")
         return "fout", 403
 
-    # --- POST: gelen olay ---
     data = request.get_json(silent=True) or {}
-    print(">>> WEBHOOK POST:", json.dumps(data)[:1500], flush=True)
+    print(f">>> WEBHOOK: {json.dumps(data)[:500]}")
+    
     try:
         entry = (data.get("entry") or [{}])[0]
         changes = (entry.get("changes") or [{}])[0]
         val = changes.get("value") or {}
-
-        # status/read makbuzu (messages yok, statuses var) -> sessizce gec
+        
         if "messages" not in val:
             return "ok", 200
-
+            
         msg = val["messages"][0]
         frm = msg["from"]
-
+        
         if msg["type"] == "text":
-            # 1. adim: dil sec
             rows = [{"id": f"taal_{t['code']}", "title": t["naam"]} for t in TALEN]
             send_list(frm, BEDRIJF_NAAM, tr(STANDAARD_TAAL, "kies_taal"), "Dil / Language", rows,
                       afbeelding=HEADER_AFBEELDING or None)
             return "ok", 200
-
+            
         elif msg["type"] == "interactive":
             itype = msg["interactive"]["type"]
-            if itype == "list_reply":
-                reply_id = msg["interactive"]["list_reply"]["id"]
-            else:
-                reply_id = msg["interactive"].get("button_reply", {}).get("id", "")
-
+            reply_id = msg["interactive"]["list_reply"]["id"] if itype == "list_reply" else msg["interactive"].get("button_reply", {}).get("id", "")
+            
             if reply_id.startswith("taal_"):
                 taal = reply_id[5:]
                 rows = []
@@ -420,7 +396,7 @@ def webhook():
                 for b in range(n_blokken):
                     rows.append({"id": f"blok_{b}_{taal}", "title": blok_label(b, taal)[:24]})
                 send_list(frm, BEDRIJF_NAAM, tr(taal, "welkom", bedrijf=BEDRIJF_NAAM), tr(taal, "kies_periode"), rows)
-
+                
             elif reply_id.startswith("blok_"):
                 _, b_str, taal = reply_id.split("_", 2)
                 b = int(b_str)
@@ -430,7 +406,7 @@ def webhook():
                     return "ok", 200
                 rows = [{"id": f"dag_{d.isoformat()}_{taal}", "title": dag_label(d, taal)[:24]} for d in dagen]
                 send_list(frm, BEDRIJF_NAAM, tr(taal, "kies_dag_body"), tr(taal, "kies_dag"), rows)
-
+                
             elif reply_id.startswith("dag_"):
                 _, d_str, taal = reply_id.split("_", 2)
                 d = datetime.fromisoformat(d_str).date()
@@ -440,7 +416,7 @@ def webhook():
                     return "ok", 200
                 rows = [{"id": f"slot_{s.isoformat()}_{taal}", "title": s.strftime("%H:%M")} for s in slots[:10]]
                 send_list(frm, dag_label(d, taal), tr(taal, "kies_tijd_body"), tr(taal, "kies_tijd"), rows)
-
+                
             elif reply_id.startswith("slot_"):
                 _, start_iso, taal = reply_id.split("_", 2)
                 start_dt = datetime.fromisoformat(start_iso)
@@ -457,116 +433,110 @@ def webhook():
                 else:
                     verwijder_event(event_id)
                     send_text(frm, tr(taal, "fout"))
-
+                    
     except Exception as e:
-        print("HATA (webhook):", e, flush=True)
+        print(f"WEBHOOK HATA: {e}")
         import traceback
         traceback.print_exc()
+    
     return "ok", 200
 
-
-# ---------------- Payriff callback (DÜZELTİLMİŞ) ----------------
+# ---------------- Payriff Callback (DÜZELTİLMİŞ) ----------------
 @app.route("/payriff-callback", methods=["POST", "GET"])
 def payriff_callback():
-    print(">>> PAYRIFF CALLBACK RECEIVED", flush=True)
+    print(">>> PAYRIFF CALLBACK GELDİ!")
     
     try:
-        # GET veya POST'tan gelen verileri al
+        # Tüm veri kaynaklarını kontrol et
+        data = {}
         if request.method == "GET":
             data = request.args.to_dict()
-            print(f"PAYRIFF CALLBACK GET DATA: {data}", flush=True)
         else:
-            data = request.get_json(silent=True) or {}
+            if request.is_json:
+                data = request.get_json(silent=True) or {}
             if not data:
                 data = request.form.to_dict()
-            print(f"PAYRIFF CALLBACK POST DATA: {data}", flush=True)
+            if not data:
+                data = request.data.decode('utf-8')
+                try:
+                    data = json.loads(data)
+                except:
+                    data = {}
         
-        # Payriff'tan gelen orderId'yi bul
+        print(f"📦 CALLBACK DATA: {json.dumps(data)}")
+        
+        # Order ID'yi bul
         order_id = None
-        if "payload" in data and isinstance(data["payload"], dict):
-            order_id = data["payload"].get("orderId")
-        elif "orderId" in data:
-            order_id = data["orderId"]
-        elif "order_id" in data:
-            order_id = data["order_id"]
+        if isinstance(data, dict):
+            if "payload" in data and isinstance(data["payload"], dict):
+                order_id = data["payload"].get("orderId")
+            if not order_id and "orderId" in data:
+                order_id = data["orderId"]
+            if not order_id and "order_id" in data:
+                order_id = data["order_id"]
         
-        # Eğer order_id bulunamadıysa, query string'den dene
+        # Query string'den dene
         if not order_id:
             order_id = request.args.get("orderId") or request.args.get("order_id")
-            
-        print(f"PAYRIFF CALLBACK ORDER ID: {order_id}", flush=True)
         
         if not order_id:
-            print("PAYRIFF CALLBACK: No order_id found", flush=True)
+            print("❌ Order ID bulunamadı!")
             return "ok", 200
-            
-        # Order durumunu Payriff'ten sorgula
-        status_url = f"https://api.payriff.com/api/v3/orders/{order_id}"
-        print(f"PAYRIFF STATUS URL: {status_url}", flush=True)
         
+        print(f"🔍 Order ID: {order_id}")
+        
+        # Order durumunu sorgula
+        status_url = f"https://api.payriff.com/api/v3/orders/{order_id}"
         r = requests.get(status_url, headers=PAYRIFF_HEAD, timeout=30)
-        print(f"PAYRIFF STATUS RESPONSE STATUS: {r.status_code}", flush=True)
-        print(f"PAYRIFF STATUS RESPONSE: {r.text[:500]}", flush=True)
+        
+        print(f"📊 STATUS RESPONSE: {r.status_code} - {r.text[:500]}")
         
         if r.status_code != 200:
-            print(f"PAYRIFF STATUS CHECK FAILED: {r.status_code}", flush=True)
+            print(f"❌ Order sorgulanamadı: {r.status_code}")
             return "ok", 200
-            
+        
         status_data = r.json()
         payload = status_data.get("payload") or {}
         status = payload.get("paymentStatus")
-        order_id_from_response = payload.get("orderId") or status_data.get("orderId")
         
-        print(f"PAYRIFF ORDER STATUS: {status}, ORDER ID: {order_id_from_response}", flush=True)
+        print(f"💰 ÖDƏMƏ STATUSU: {status}")
         
-        # Eğer status "PAID" ise kullanıcıyı bilgilendir
+        # Order bilgilerini al
+        info = payriff_orders.get(order_id, {})
+        to = info.get("whatsapp")
+        label = info.get("label", "")
+        event_id = info.get("event_id")
+        taal = info.get("taal", "az")
+        
         if status == "PAID":
-            # Order bilgilerini al
-            info = payriff_orders.get(order_id, {})
-            to = info.get("whatsapp")
-            label = info.get("label", "")
-            event_id = info.get("event_id")
-            taal = info.get("taal", "az")
-            
-            print(f"PAYRIFF PAID - to: {to}, label: {label}, event_id: {event_id}", flush=True)
+            print(f"✅ ÖDEMƏ BAŞARILI! {to} numarasına mesaj gönderilecek...")
             
             if to and event_id:
-                # Takvimdeki etkinliği onayla
                 if bevestig_event(event_id):
-                    # Kullanıcıya başarılı mesajı gönder
-                    success_message = tr(taal, "bevestigd", label=label, bedrijf=BEDRIJF_NAAM)
-                    send_text(to, success_message)
-                    print(f"PAYRIFF SUCCESS MESSAGE SENT TO {to}", flush=True)
-                
-                # Order'ı temizle
-                payriff_orders.pop(order_id, None)
-                print(f"PAYRIFF ORDER {order_id} REMOVED FROM STORE", flush=True)
-            else:
-                print(f"PAYRIFF MISSING INFO FOR ORDER {order_id}: {info}", flush=True)
-                
+                    success_msg = tr(taal, "bevestigd", label=label, bedrijf=BEDRIJF_NAAM)
+                    send_text(to, success_msg)
+                    print(f"✅ WhatsApp onay mesajı gönderildi: {to}")
+                else:
+                    print(f"❌ Event onaylanamadı: {event_id}")
+            
+            payriff_orders.pop(order_id, None)
+            
         elif status in ("DECLINED", "CANCELED", "EXPIRED", "FAILED"):
-            # Başarısız ödeme durumunda etkinliği sil
-            info = payriff_orders.get(order_id, {})
-            event_id = info.get("event_id")
+            print(f"❌ Ödeme başarısız: {status}")
             if event_id:
                 verwijder_event(event_id)
-                print(f"PAYRIFF ORDER {order_id} FAILED, EVENT {event_id} DELETED", flush=True)
-            
-            # Order'ı temizle
             payriff_orders.pop(order_id, None)
-            print(f"PAYRIFF ORDER {order_id} REMOVED FROM STORE (FAILED)", flush=True)
             
     except Exception as e:
-        print("HATA (payriff-callback):", str(e), flush=True)
+        print(f"❌ PAYRIFF CALLBACK HATA: {e}")
         import traceback
         traceback.print_exc()
     
     return "ok", 200
 
-
+# ---------------- Başarılı Ödeme Sayfası ----------------
 @app.route("/betaald", methods=["GET"])
 def betaald():
-    # Başarılı ödeme sayfası
     html = """
     <!DOCTYPE html>
     <html>
@@ -575,58 +545,55 @@ def betaald():
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Ödəniş uğurlu!</title>
         <style>
+            * { margin: 0; padding: 0; box-sizing: border-box; }
             body {
-                font-family: Arial, sans-serif;
-                text-align: center;
-                padding: 50px;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
                 background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                color: white;
-                margin: 0;
                 min-height: 100vh;
                 display: flex;
-                flex-direction: column;
-                justify-content: center;
-                align-items: center;
             }
             .container {
-                background: rgba(255,255,255,0.9);
-                padding: 40px;
-                border-radius: 20px;
-                box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+                background: rgba(255,255,255,0.95);
+                margin: auto;
+                padding: 50px 40px;
+                border-radius: 24px;
+                box-shadow: 0 20px 60px rgba(0,0,0,0.3);
                 max-width: 500px;
                 width: 90%;
+                text-align: center;
+            }
+            .icon {
+                font-size: 72px;
+                margin-bottom: 20px;
             }
             h1 {
                 color: #2d3748;
                 font-size: 32px;
                 margin-bottom: 10px;
             }
-            .emoji {
-                font-size: 60px;
-                margin-bottom: 20px;
-            }
             p {
                 color: #4a5568;
                 font-size: 18px;
                 line-height: 1.6;
+                margin-bottom: 25px;
             }
-            .button {
+            .btn {
                 display: inline-block;
                 background: #48bb78;
                 color: white;
-                padding: 12px 30px;
-                border-radius: 30px;
+                padding: 14px 40px;
+                border-radius: 50px;
                 text-decoration: none;
-                font-weight: bold;
-                margin-top: 20px;
-                transition: all 0.3s;
+                font-weight: 600;
+                font-size: 16px;
+                transition: transform 0.2s, box-shadow 0.2s;
             }
-            .button:hover {
-                background: #38a169;
+            .btn:hover {
                 transform: scale(1.05);
+                box-shadow: 0 10px 20px rgba(72, 187, 120, 0.3);
             }
             .sub {
-                color: #718096;
+                color: #a0aec0;
                 font-size: 14px;
                 margin-top: 20px;
             }
@@ -634,11 +601,10 @@ def betaald():
     </head>
     <body>
         <div class="container">
-            <div class="emoji">✅</div>
+            <div class="icon">✅</div>
             <h1>Ödəniş uğurlu!</h1>
-            <p>Randevunuz təsdiqləndi.<br>
-            WhatsApp-dan təsdiq mesajı alacaqsınız.</p>
-            <a href="https://wa.me/" class="button">WhatsApp'a qayıt</a>
+            <p>Randevunuz təsdiqləndi.<br>WhatsApp-dan təsdiq mesajı alacaqsınız.</p>
+            <a href="https://wa.me/" class="btn">WhatsApp'a qayıt</a>
             <div class="sub">Bu səhifəni bağlaya bilərsiniz</div>
         </div>
     </body>
@@ -646,10 +612,12 @@ def betaald():
     """
     return html
 
+@app.route("/", methods=["GET"])
+def home():
+    return "✅ Bot çalışıyor!", 200
 
-# temizleyici thread'i baslat
+# ---------------- Başlat ----------------
 threading.Thread(target=opschoon_loop, daemon=True).start()
-
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
