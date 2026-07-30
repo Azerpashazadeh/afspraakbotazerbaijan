@@ -1,4 +1,4 @@
-from flask import Flask, request, render_template_string
+from flask import Flask, request, render_template_string, jsonify
 import requests
 import os
 import json
@@ -11,13 +11,12 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 # ============================================================
-#  MUSTERI AYARLARI (config)
+#  MUSTERI AYARLARI
 # ============================================================
 BEDRIJF_NAAM = "Salon Test"
 HEADER_AFBEELDING = ""
-BEGROETING = "Salon Test-e xos gelmisiniz!"
-
 STANDAARD_TAAL = "az"
+
 TALEN = [
     {"code": "az", "naam": "\U0001F1E6\U0001F1FF Azərbaycan"},
     {"code": "ru", "naam": "\U0001F1F7\U0001F1FA Русский"},
@@ -311,51 +310,107 @@ def opschoon_loop():
             print(f"opschoon_loop HATA: {e}")
         _time.sleep(300)
 
-# ---------------- Payriff ----------------
+# ============================================================
+# PAYRIFF ENTEGRASYONU - YENİDEN DÜZENLENDİ
+# ============================================================
+
+# Order'ları sakla (geçici bellek)
 payriff_orders = {}
 
 def create_payriff_payment(to, start_iso, label, event_id, taal="az"):
+    """Payriff'te ödeme bağlantısı oluştur"""
     dil = {"az": "AZ", "ru": "RU", "en": "EN", "tr": "AZ"}.get(taal, "AZ")
+    
     try:
+        # Order oluştur
+        payload = {
+            "amount": float(AANBETALING_BEDRAG),
+            "language": dil,
+            "currency": "AZN",
+            "description": f"{AANBETALING_OMSCHRIJVING} ({label})",
+            "callbackUrl": f"{BASE_URL}/payriff-callback",
+            "cardSave": False,
+            "operation": "PURCHASE",
+            "merchant": PAYRIFF_MERCHANT  # Merchant ID'yi ekleyelim
+        }
+        
+        print(f"📤 PAYRIFF REQUEST: {json.dumps(payload)}")
+        
         resp = requests.post(
             "https://api.payriff.com/api/v3/orders",
             headers=PAYRIFF_HEAD,
-            json={
-                "amount": float(AANBETALING_BEDRAG),
-                "language": dil,
-                "currency": "AZN",
-                "description": f"{AANBETALING_OMSCHRIJVING} ({label})",
-                "callbackUrl": f"{BASE_URL}/payriff-callback",
-                "cardSave": False,
-                "operation": "PURCHASE"
-            },
+            json=payload,
             timeout=30
         )
         
-        print(f"PAYRIFF CREATE STATUS: {resp.status_code}")
-        print(f"PAYRIFF CREATE RESPONSE: {resp.text[:500]}")
+        print(f"📥 PAYRIFF RESPONSE STATUS: {resp.status_code}")
+        print(f"📥 PAYRIFF RESPONSE BODY: {resp.text[:500]}")
+        
+        if resp.status_code != 200:
+            print(f"❌ Payriff order oluşturulamadı: {resp.status_code}")
+            return None
+            
+        data = resp.json()
+        
+        # Response'u kontrol et
+        if data.get("status") != "SUCCESS":
+            print(f"❌ Payriff hatası: {data.get('message')}")
+            return None
+            
+        payload_data = data.get("payload") or {}
+        order_id = payload_data.get("orderId")
+        payment_url = payload_data.get("paymentUrl")
+        
+        if order_id and payment_url:
+            # Order'ı sakla
+            payriff_orders[order_id] = {
+                "whatsapp": to,
+                "label": label,
+                "event_id": event_id,
+                "taal": taal,
+                "created_at": datetime.now().isoformat()
+            }
+            print(f"✅ Payriff order oluşturuldu: {order_id}")
+            print(f"🔗 Ödeme linki: {payment_url}")
+            return payment_url
+        else:
+            print(f"❌ Payriff response'da orderId veya paymentUrl yok: {data}")
+            return None
+            
+    except Exception as e:
+        print(f"❌ create_payriff_payment HATA: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def check_payriff_order_status(order_id):
+    """Payriff'ten order durumunu sorgula"""
+    try:
+        url = f"https://api.payriff.com/api/v3/orders/{order_id}"
+        print(f"🔍 Checking order status: {url}")
+        
+        resp = requests.get(url, headers=PAYRIFF_HEAD, timeout=30)
+        
+        print(f"📊 Status check response: {resp.status_code}")
+        print(f"📊 Status check body: {resp.text[:500]}")
         
         if resp.status_code != 200:
             return None
             
         data = resp.json()
         payload = data.get("payload") or {}
-        order_id = payload.get("orderId")
-        payment_url = payload.get("paymentUrl")
         
-        if order_id and payment_url:
-            payriff_orders[order_id] = {
-                "whatsapp": to,
-                "label": label,
-                "event_id": event_id,
-                "taal": taal
-            }
-            print(f"✅ Payriff order oluşturuldu: {order_id}")
-            return payment_url
-        return None
+        return {
+            "status": payload.get("paymentStatus"),
+            "amount": payload.get("amount"),
+            "currency": payload.get("currency"),
+            "order_id": payload.get("orderId")
+        }
     except Exception as e:
-        print(f"create_payriff_payment HATA: {e}")
+        print(f"❌ check_payriff_order_status HATA: {e}")
         return None
+
 
 # ---------------- Webhook ----------------
 @app.route("/webhook", methods=["GET", "POST"])
@@ -441,98 +496,138 @@ def webhook():
     
     return "ok", 200
 
-# ---------------- Payriff Callback (DÜZELTİLMİŞ) ----------------
+
+# ---------------- Payriff Callback (YENİDEN DÜZENLENDİ) ----------------
 @app.route("/payriff-callback", methods=["POST", "GET"])
 def payriff_callback():
-    print(">>> PAYRIFF CALLBACK GELDİ!")
+    """
+    Payriff callback endpoint'i
+    Payriff buraya ödeme sonucunu bildirir
+    """
+    print("=" * 60)
+    print("🔔 PAYRIFF CALLBACK GELDİ!")
+    print("=" * 60)
     
-    try:
-        # Tüm veri kaynaklarını kontrol et
-        data = {}
-        if request.method == "GET":
-            data = request.args.to_dict()
+    # 1. Tüm veri kaynaklarını kontrol et
+    data = {}
+    
+    # GET parametreleri
+    if request.method == "GET":
+        data = request.args.to_dict()
+        print(f"📥 GET verileri: {data}")
+    
+    # POST verileri (JSON)
+    if request.method == "POST":
+        if request.is_json:
+            data = request.get_json(silent=True) or {}
+            print(f"📥 JSON verileri: {data}")
         else:
-            if request.is_json:
-                data = request.get_json(silent=True) or {}
+            # Form verileri
+            data = request.form.to_dict()
+            print(f"📥 Form verileri: {data}")
+            
+            # Raw body
             if not data:
-                data = request.form.to_dict()
-            if not data:
-                data = request.data.decode('utf-8')
+                raw_data = request.data.decode('utf-8')
+                print(f"📥 Raw body: {raw_data}")
                 try:
-                    data = json.loads(data)
+                    if raw_data:
+                        data = json.loads(raw_data)
                 except:
-                    data = {}
-        
-        print(f"📦 CALLBACK DATA: {json.dumps(data)}")
-        
-        # Order ID'yi bul
-        order_id = None
-        if isinstance(data, dict):
-            if "payload" in data and isinstance(data["payload"], dict):
-                order_id = data["payload"].get("orderId")
-            if not order_id and "orderId" in data:
-                order_id = data["orderId"]
-            if not order_id and "order_id" in data:
-                order_id = data["order_id"]
-        
-        # Query string'den dene
-        if not order_id:
-            order_id = request.args.get("orderId") or request.args.get("order_id")
-        
-        if not order_id:
-            print("❌ Order ID bulunamadı!")
-            return "ok", 200
-        
-        print(f"🔍 Order ID: {order_id}")
-        
-        # Order durumunu sorgula
-        status_url = f"https://api.payriff.com/api/v3/orders/{order_id}"
-        r = requests.get(status_url, headers=PAYRIFF_HEAD, timeout=30)
-        
-        print(f"📊 STATUS RESPONSE: {r.status_code} - {r.text[:500]}")
-        
-        if r.status_code != 200:
-            print(f"❌ Order sorgulanamadı: {r.status_code}")
-            return "ok", 200
-        
-        status_data = r.json()
-        payload = status_data.get("payload") or {}
-        status = payload.get("paymentStatus")
-        
-        print(f"💰 ÖDƏMƏ STATUSU: {status}")
-        
-        # Order bilgilerini al
-        info = payriff_orders.get(order_id, {})
-        to = info.get("whatsapp")
-        label = info.get("label", "")
-        event_id = info.get("event_id")
-        taal = info.get("taal", "az")
-        
-        if status == "PAID":
-            print(f"✅ ÖDEMƏ BAŞARILI! {to} numarasına mesaj gönderilecek...")
-            
-            if to and event_id:
-                if bevestig_event(event_id):
-                    success_msg = tr(taal, "bevestigd", label=label, bedrijf=BEDRIJF_NAAM)
-                    send_text(to, success_msg)
-                    print(f"✅ WhatsApp onay mesajı gönderildi: {to}")
-                else:
-                    print(f"❌ Event onaylanamadı: {event_id}")
-            
-            payriff_orders.pop(order_id, None)
-            
-        elif status in ("DECLINED", "CANCELED", "EXPIRED", "FAILED"):
-            print(f"❌ Ödeme başarısız: {status}")
-            if event_id:
-                verwijder_event(event_id)
-            payriff_orders.pop(order_id, None)
-            
-    except Exception as e:
-        print(f"❌ PAYRIFF CALLBACK HATA: {e}")
-        import traceback
-        traceback.print_exc()
+                    pass
     
-    return "ok", 200
+    # 2. Header'ları logla
+    print(f"📋 Headers: {dict(request.headers)}")
+    
+    # 3. Order ID'yi bul (farklı formatlarda)
+    order_id = None
+    
+    # Payriff'in gönderdiği formatları dene
+    if isinstance(data, dict):
+        # Payriff'in standart formatı
+        if "payload" in data and isinstance(data["payload"], dict):
+            order_id = data["payload"].get("orderId") or data["payload"].get("order_id")
+        
+        # Düz formatta
+        if not order_id:
+            order_id = data.get("orderId") or data.get("order_id") or data.get("id")
+        
+        # Eski format
+        if not order_id:
+            order_id = data.get("reference") or data.get("reference_id")
+    
+    # Query string'den dene
+    if not order_id:
+        order_id = request.args.get("orderId") or request.args.get("order_id")
+    
+    print(f"🔍 Bulunan Order ID: {order_id}")
+    
+    # 4. Eğer order ID yoksa, tüm anahtarları göster
+    if not order_id:
+        print("❌ Order ID bulunamadı!")
+        print(f"📦 Tüm veri: {json.dumps(data, indent=2)}")
+        return jsonify({"status": "error", "message": "Order ID not found"}), 200
+    
+    # 5. Order durumunu sorgula
+    status_info = check_payriff_order_status(order_id)
+    
+    if not status_info:
+        print(f"❌ Order {order_id} durumu sorgulanamadı")
+        return jsonify({"status": "error", "message": "Cannot check order status"}), 200
+    
+    status = status_info.get("status")
+    print(f"💰 ÖDEME STATUSU: {status}")
+    
+    # 6. Order bilgilerini al
+    info = payriff_orders.get(order_id, {})
+    to = info.get("whatsapp")
+    label = info.get("label", "")
+    event_id = info.get("event_id")
+    taal = info.get("taal", "az")
+    
+    print(f"📋 Order bilgileri:")
+    print(f"   - WhatsApp: {to}")
+    print(f"   - Label: {label}")
+    print(f"   - Event ID: {event_id}")
+    print(f"   - Dil: {taal}")
+    
+    # 7. Duruma göre işlem yap
+    if status == "PAID":
+        print("✅ ÖDEME BAŞARILI!")
+        
+        if to and event_id:
+            # Takvimi güncelle
+            if bevestig_event(event_id):
+                # WhatsApp mesajı gönder
+                success_msg = tr(taal, "bevestigd", label=label, bedrijf=BEDRIJF_NAAM)
+                send_text(to, success_msg)
+                print(f"✅ WhatsApp onay mesajı gönderildi: {to}")
+            else:
+                print(f"❌ Event onaylanamadı: {event_id}")
+        else:
+            print(f"⚠️ Eksik bilgi: to={to}, event_id={event_id}")
+        
+        # Order'ı temizle
+        payriff_orders.pop(order_id, None)
+        print(f"🗑️ Order {order_id} temizlendi")
+        
+    elif status in ("DECLINED", "CANCELED", "EXPIRED", "FAILED"):
+        print(f"❌ Ödeme başarısız: {status}")
+        
+        if event_id:
+            verwijder_event(event_id)
+            print(f"🗑️ Event {event_id} silindi")
+        
+        # Order'ı temizle
+        payriff_orders.pop(order_id, None)
+        print(f"🗑️ Order {order_id} temizlendi")
+        
+    else:
+        print(f"ℹ️ Bilinmeyen durum: {status}")
+    
+    print("=" * 60)
+    return jsonify({"status": "ok"}), 200
+
 
 # ---------------- Başarılı Ödeme Sayfası ----------------
 @app.route("/betaald", methods=["GET"])
@@ -551,10 +646,11 @@ def betaald():
                 background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
                 min-height: 100vh;
                 display: flex;
+                align-items: center;
+                justify-content: center;
             }
             .container {
                 background: rgba(255,255,255,0.95);
-                margin: auto;
                 padding: 50px 40px;
                 border-radius: 24px;
                 box-shadow: 0 20px 60px rgba(0,0,0,0.3);
@@ -602,23 +698,4 @@ def betaald():
     <body>
         <div class="container">
             <div class="icon">✅</div>
-            <h1>Ödəniş uğurlu!</h1>
-            <p>Randevunuz təsdiqləndi.<br>WhatsApp-dan təsdiq mesajı alacaqsınız.</p>
-            <a href="https://wa.me/" class="btn">WhatsApp'a qayıt</a>
-            <div class="sub">Bu səhifəni bağlaya bilərsiniz</div>
-        </div>
-    </body>
-    </html>
-    """
-    return html
-
-@app.route("/", methods=["GET"])
-def home():
-    return "✅ Bot çalışıyor!", 200
-
-# ---------------- Başlat ----------------
-threading.Thread(target=opschoon_loop, daemon=True).start()
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+            <h1>Ödəniş uğurl
