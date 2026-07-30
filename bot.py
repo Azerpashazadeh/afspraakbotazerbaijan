@@ -2,6 +2,7 @@ from flask import Flask, request
 import requests
 import os
 import json
+import re
 import threading
 import time as _time
 from datetime import datetime, timedelta, time as dtime
@@ -273,16 +274,42 @@ def maak_pending(start_dt, klant_nummer):
 
 
 def bevestig_event(event_id):
-    """Odeme gelince: GOZLEMEDE -> TESDIQLENDI."""
+    """Odeme gelince: GOZLEMEDE -> TESDIQLENDI.
+    Idempotent: event zaten onaylanmissa (PENDING_TAG artik yoksa) False dondurur,
+    boylece hem webhook hem de polling ayni odemeyi iki kere onaylayip
+    musteriye iki kere mesaj gondermez."""
     try:
         ev = cal_service.events().get(calendarId=CALENDAR_ID, eventId=event_id).execute()
-        ev["summary"] = ev["summary"].replace(PENDING_TAG, CONFIRMED_TAG)
+        summary = ev.get("summary", "")
+        if PENDING_TAG not in summary:
+            return False
+        ev["summary"] = summary.replace(PENDING_TAG, CONFIRMED_TAG)
         ev["description"] = ev.get("description", "").replace("Odenis gozlenilir.", "Odenildi.")
         cal_service.events().update(calendarId=CALENDAR_ID, eventId=event_id, body=ev).execute()
         return True
     except Exception as e:
         print("bevestig_event HATA:", e)
         return False
+
+
+def event_order_id_ekle(event_id, order_id):
+    """Pending event'in description'ina order_id ekler, boylece polling dongusu
+    bu event'in hangi Payriff siparisine ait oldugunu bulabilir."""
+    try:
+        ev = cal_service.events().get(calendarId=CALENDAR_ID, eventId=event_id).execute()
+        desc = ev.get("description", "") or ""
+        if "order:" not in desc:
+            desc = f"{desc} | order:{order_id}"
+            cal_service.events().patch(calendarId=CALENDAR_ID, eventId=event_id,
+                                        body={"description": desc}).execute()
+    except Exception as e:
+        print("event_order_id_ekle HATA:", e)
+
+
+def event_order_id_al(ev):
+    desc = ev.get("description", "") or ""
+    m = re.search(r"order:([\w-]+)", desc)
+    return m.group(1) if m else None
 
 
 def verwijder_event(event_id):
@@ -314,6 +341,19 @@ def opschoon_loop():
                 created_dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
                 leeftijd = (datetime.now(created_dt.tzinfo) - created_dt).total_seconds() / 60
                 if leeftijd > RESERVERING_MINUTEN:
+                    # Silmeden once son bir kez dogrudan Payriff'ten kontrol et:
+                    # odeme aslinda yapilmis ama teyit (bevestig_event) herhangi bir
+                    # sebeple gecikmisse, odenmis randevuyu yanlislikla silmeyelim.
+                    order_id = event_order_id_al(ev)
+                    if order_id:
+                        status, meta = get_order_status(order_id)
+                        if status == "PAID":
+                            to = meta.get("whatsapp")
+                            label = meta.get("label", "")
+                            taal = meta.get("taal", "az")
+                            if bevestig_event(ev["id"]) and to:
+                                send_text(to, tr(taal, "bevestigd", label=label, bedrijf=BEDRIJF_NAAM))
+                            continue
                     verwijder_event(ev["id"])
                     print("Temizlendi (odenmemis):", ev.get("summary"))
         except Exception as e:
@@ -329,6 +369,7 @@ def opschoon_loop():
 # calissa da, uygulama yeniden baslasa da (redeploy/restart) bilgi kaybolmuyor
 # -- cunku bellege hic yazilmiyor, her seferinde Payriff'ten okunuyor.
 def create_payriff_payment(to, start_iso, label, event_id, taal="az"):
+    """Basarili olursa (payment_url, order_id) tuple'i, basarisiz olursa (None, None) dondurur."""
     dil = {"az": "AZ", "ru": "RU", "en": "EN", "tr": "AZ"}.get(taal, "AZ")
     try:
         resp = requests.post("https://api.payriff.com/api/v3/orders",
@@ -351,10 +392,62 @@ def create_payriff_payment(to, start_iso, label, event_id, taal="az"):
         print("PAYRIFF CREATE:", resp.status_code, json.dumps(data)[:500], flush=True)
         payload = data.get("payload") or {}
         payment_url = payload.get("paymentUrl")
-        return payment_url
+        order_id = payload.get("orderId")
+        return payment_url, order_id
     except Exception as e:
         print("PAYRIFF CREATE HATA:", e, flush=True)
-        return None
+        return None, None
+
+
+def get_order_status(order_id):
+    """Payriff'ten order durumunu ve metadata'yi sorgular. (status, metadata) dondurur."""
+    try:
+        r = requests.get(f"https://api.payriff.com/api/v3/orders/{order_id}",
+                         headers=PAYRIFF_HEAD, timeout=15)
+        payload = (r.json() or {}).get("payload") or {}
+        return payload.get("paymentStatus"), (payload.get("metadata") or {})
+    except Exception as e:
+        print("PAYRIFF STATUS SORGU HATA:", order_id, e, flush=True)
+        return None, {}
+
+
+# ---------------- Odeme durumu icin polling dongusu ----------------
+# Payriff'in callbackUrl'i bazi durumlarda (musteri odeme sonrasi tarayiciyi
+# kapatirsa) hic tetiklenmeyebiliyor. Bu yuzden webhook'a ek olarak, bekleyen
+# tum randevularin odeme durumunu duzenli araliklarla BIZ soruyoruz. Webhook
+# calisirsa onay hizli gelir; calismazsa bu dongu en gec ~20 saniye icinde
+# durumu yakalar. bevestig_event idempotent oldugu icin ikisi ayni anda
+# tetiklense bile mesaj sadece bir kere gider.
+def odeme_kontrol_loop():
+    while True:
+        try:
+            now = _now()
+            start = now - timedelta(days=1)
+            eind = now + timedelta(days=DAGEN_VOORUIT + 1)
+            res = cal_service.events().list(
+                calendarId=CALENDAR_ID,
+                timeMin=start.isoformat(),
+                timeMax=eind.isoformat(),
+                singleEvents=True, q=PENDING_TAG
+            ).execute()
+            for ev in res.get("items", []):
+                if PENDING_TAG not in ev.get("summary", ""):
+                    continue
+                order_id = event_order_id_al(ev)
+                if not order_id:
+                    continue
+                status, meta = get_order_status(order_id)
+                if status == "PAID":
+                    to = meta.get("whatsapp")
+                    label = meta.get("label", "")
+                    taal = meta.get("taal", "az")
+                    if bevestig_event(ev["id"]) and to:
+                        send_text(to, tr(taal, "bevestigd", label=label, bedrijf=BEDRIJF_NAAM))
+                elif status in ("DECLINED", "CANCELED", "EXPIRED", "FAILED"):
+                    verwijder_event(ev["id"])
+        except Exception as e:
+            print("odeme_kontrol_loop HATA:", e, flush=True)
+        _time.sleep(20)  # her 20 saniyede bir kontrol et
 
 
 # ---------------- WhatsApp webhook ----------------
@@ -433,8 +526,9 @@ def webhook():
                     return "ok", 200
                 label = f"{dag_label(start_dt.date(), taal)} {start_dt.strftime('%H:%M')}"
                 event_id = maak_pending(start_dt, frm)
-                link = create_payriff_payment(frm, start_iso, label, event_id, taal)
-                if link:
+                link, order_id = create_payriff_payment(frm, start_iso, label, event_id, taal)
+                if link and order_id:
+                    event_order_id_ekle(event_id, order_id)
                     send_text(frm, tr(taal, "gekozen", label=label, min=RESERVERING_MINUTEN, bedrag=AANBETALING_BEDRAG, link=link))
                 else:
                     verwijder_event(event_id)
@@ -459,16 +553,11 @@ def payriff_callback():
         if not order_id:
             return "ok", 200
 
-        # Order durumunu ve metadata'yi Payriff'ten dogrula.
-        # Bilgi hic bir zaman process belleginde tutulmuyor; her seferinde
-        # dogrudan Payriff'e sorulan bu GET istegiyle geliyor. Bu sayede
-        # birden fazla worker/process olmasi ya da uygulamanin yeniden
-        # baslamasi bu akisi bozmuyor.
-        r = requests.get(f"https://api.payriff.com/api/v3/orders/{order_id}",
-                         headers=PAYRIFF_HEAD, timeout=15)
-        payload = (r.json() or {}).get("payload") or {}
-        status = payload.get("paymentStatus")
-        meta = payload.get("metadata") or {}
+        # Bu, webhook gelirse hizli yol saglar. Ama guvenceyi bu callback'e
+        # degil, asagidaki odeme_kontrol_loop polling dongusune borcluyuz --
+        # cunku Payriff'in callbackUrl'i her zaman garanti tetiklenmiyor
+        # (bkz. yorum: odeme_kontrol_loop tanimi).
+        status, meta = get_order_status(order_id)
         print(">>> PAYRIFF STATUS:", order_id, status, "META:", meta, flush=True)
 
         to = meta.get("whatsapp")
@@ -491,8 +580,9 @@ def betaald():
     return "Tesekkurler! Bu pencereni baglayib WhatsApp-a qayida bilersiniz.", 200
 
 
-# temizleyici thread'i baslat
+# temizleyici ve odeme-kontrol thread'lerini baslat
 threading.Thread(target=opschoon_loop, daemon=True).start()
+threading.Thread(target=odeme_kontrol_loop, daemon=True).start()
 
 
 if __name__ == "__main__":
